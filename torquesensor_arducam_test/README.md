@@ -55,8 +55,18 @@ python3 test_both.py -d 20
 Run any script with `--help` for all options. Ctrl+C stops early; the sensor is
 still deactivated and shut down, and the camera is asked to finish its file.
 
-`--port` overrides `com_port` in `bota_binary_gen0.json` without editing it.
-The config actually used is saved as `bota_config_used.json` in the results folder.
+`--port` overrides `com_port` and `--sinc-length` overrides `sinc_length` in
+`bota_binary_gen0.json` without editing it. The config actually used is saved as
+`bota_config_used.json` in the results folder.
+
+### If the sensor fails to configure
+
+`sinc_length` is `2`, copied from the payload config. That value has not been
+confirmed on the sensor; Bota's sample config uses `128`. If the driver prints
+`Invalid sinc length`, the test says so and suggests a fix. Rerun with
+`--sinc-length 128`, and if that works, change `sinc_length` to `128` in
+`bota_binary_gen0.json`. The sinc length also sets the sensor's sample rate, so
+check the rate in the summary after changing it.
 
 ## Reading the results
 

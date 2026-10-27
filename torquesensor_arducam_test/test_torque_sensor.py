@@ -24,6 +24,10 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "bota_binary_gen0.json"
 DEFAULT_OUT_DIR = HERE / "results"
 
+# Value used in Bota's sample bota_binary_gen0.json. The payload config uses 2,
+# which has not been confirmed on the sensor.
+BOTA_SAMPLE_SINC_LENGTH = 128
+
 CSV_HEADER = [
     "utc_time", "monotonic_s", "elapsed_s", "sensor_timestamp",
     "status_val", "invalid", "overrange", "throttled",
@@ -52,16 +56,34 @@ def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def load_config(config_path: Path, port: str | None) -> dict[str, Any]:
+def load_config(config_path: Path, port: str | None = None,
+                sinc_length: int | None = None) -> dict[str, Any]:
     with open(config_path) as f:
         config = json.load(f)
     if port:
         config["driver_config"]["communication_interface_params"]["com_port"] = port
+    if sinc_length is not None:
+        config["driver_config"]["sensor_operation_params"]["sinc_length"] = sinc_length
     return config
 
 
 def config_port(config: dict[str, Any]) -> str:
     return config["driver_config"]["communication_interface_params"]["com_port"]
+
+
+def sinc_hint(config_path: Path) -> str:
+    """Suggest the sample sinc_length when the configured one may be what failed."""
+    try:
+        sinc = load_config(config_path)["driver_config"]["sensor_operation_params"]["sinc_length"]
+    except (OSError, KeyError, ValueError):
+        return ""
+    if sinc == BOTA_SAMPLE_SINC_LENGTH:
+        return ""
+    return (
+        f"\n  The config has sinc_length = {sinc}. If the driver output above says "
+        f"'Invalid sinc length', change sinc_length to {BOTA_SAMPLE_SINC_LENGTH} "
+        f"in bota_binary_gen0.json,\n  or rerun with --sinc-length {BOTA_SAMPLE_SINC_LENGTH}."
+    )
 
 
 def check_port(port: str) -> None:
@@ -76,9 +98,10 @@ def check_port(port: str) -> None:
     )
 
 
-def prepare_config(config_path: Path, port: str | None, out_dir: Path) -> Path:
-    """Apply the port override, check the port, and save the config used next to the results."""
-    config = load_config(config_path, port)
+def prepare_config(config_path: Path, port: str | None, out_dir: Path,
+                   sinc_length: int | None = None) -> Path:
+    """Apply overrides, check the port, and save the config used next to the results."""
+    config = load_config(config_path, port, sinc_length)
     check_port(config_port(config))
     used = out_dir / "bota_config_used.json"
     used.write_text(json.dumps(config, indent=4))
@@ -98,7 +121,7 @@ def start_driver(config_path: Path) -> Any:
     try:
         driver = bota_driver.BotaDriver(str(config_path))
     except RuntimeError as e:
-        raise SensorError(f"Driver could not open the sensor: {e}") from e
+        raise SensorError(f"Driver could not open the sensor: {e}{sinc_hint(config_path)}") from e
 
     steps = [("configure", driver.configure), ("tare", driver.tare), ("activate", driver.activate)]
     for name, step in steps:
@@ -110,9 +133,10 @@ def start_driver(config_path: Path) -> Any:
         if not ok:
             # Not active yet, so only shutdown is needed.
             stop_driver(driver, active=False)
+            hint = sinc_hint(config_path) if name == "configure" else ""
             raise SensorError(
                 f"Driver failed to {name}. Check the config file, the port, "
-                f"and that no other program is using the sensor."
+                f"and that no other program is using the sensor.{hint}"
             )
     return driver
 
@@ -211,6 +235,9 @@ def add_sensor_args(parser: argparse.ArgumentParser) -> None:
                         help="Bota driver JSON config (default: %(default)s)")
     parser.add_argument("--port", help="serial port, overrides com_port in the config "
                                        "(config default: /dev/ttyACM0)")
+    parser.add_argument("--sinc-length", type=int,
+                        help="overrides sinc_length in the config (config default: 2, "
+                             f"Bota's sample uses {BOTA_SAMPLE_SINC_LENGTH})")
 
 
 def main() -> int:
@@ -228,7 +255,7 @@ def main() -> int:
     csv_path = out_dir / "torque_sensor.csv"
 
     try:
-        config_used = prepare_config(args.config, args.port, out_dir)
+        config_used = prepare_config(args.config, args.port, out_dir, args.sinc_length)
         print(f"Starting sensor using {config_used} ...")
         driver = start_driver(config_used)
     except SensorError as e:

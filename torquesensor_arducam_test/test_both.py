@@ -45,7 +45,7 @@ def main() -> int:
     # does not leave the sensor half set up.
     try:
         exe = find_camera_command()
-        config_used = prepare_config(args.config, args.port, out_dir)
+        config_used = prepare_config(args.config, args.port, out_dir, args.sinc_length)
     except (CameraError, SensorError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
