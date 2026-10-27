@@ -13,6 +13,7 @@ import csv
 import glob
 import json
 import os
+import platform
 import sys
 import time
 from dataclasses import dataclass
@@ -113,9 +114,13 @@ def start_driver(config_path: Path) -> Any:
     try:
         import bota_driver
     except ImportError as e:
-        raise SensorError(
-            "bota_driver is not installed. Run: pip install -r requirements.txt"
-        ) from e
+        msg = "bota_driver is not installed. Run: pip install -r requirements.txt"
+        # bota-driver only ships 64-bit wheels. Check Python's own word size, since
+        # 32-bit Raspberry Pi OS can run a 64-bit kernel that reports aarch64.
+        if sys.maxsize <= 2**32:
+            msg += (f"\n  This Python is 32-bit ({platform.machine()}). bota-driver needs a "
+                    f"64-bit OS: install 64-bit Raspberry Pi OS (works on Pi 3 and Pi 4).")
+        raise SensorError(msg) from e
 
     # The constructor already opens the serial port and raises RuntimeError on failure.
     try:

@@ -1,7 +1,8 @@
 # Torque sensor and Arducam hardware tests
 
 Standalone tests for the Bota torque sensor (BFT-SENS-SER-M8, SN000853) and the
-Arducam on a Raspberry Pi 4B. They need only the sensor, the camera and the Pi:
+Arducam on a Raspberry Pi 4B or Pi 3 (64-bit OS required, see
+[Install](#install)). They need only the sensor, the camera and the Pi:
 no DCE, reaction wheels, Maxon motor or IMU, and nothing from the PayloadSoftware repo.
 
 | Script | What it does |
@@ -23,16 +24,26 @@ All three default to 10 seconds and write to `results/` inside this folder
 - **Camera:** connect the Arducam ribbon cable to the Pi's CAMERA port with the Pi
   powered off. Check it is detected with `rpicam-hello --list-cameras` (or
   `libcamera-hello --list-cameras` on older images). Some Arducam modules need a
-  `dtoverlay=` line in `/boot/firmware/config.txt`; see Arducam's docs for your module.
+  `dtoverlay=` line in `/boot/firmware/config.txt` (`/boot/config.txt` on
+  Bullseye); see Arducam's docs for your module. On Bullseye, the legacy camera
+  option in `raspi-config` must be off, or libcamera will not see the camera.
+- **Power:** use the official supply (2.5 A for a Pi 3, 3 A for a Pi 4). The
+  sensor and camera both draw from the Pi, and an undervolted Pi can drop USB.
 
 ## Install
 
-Use 64-bit Raspberry Pi OS (Bookworm or later). `bota-driver` only ships Linux
-wheels for 64-bit ARM (aarch64) and x86_64, so it will not install on 32-bit
-Raspberry Pi OS.
+Use **64-bit** Raspberry Pi OS, Bullseye or Bookworm. This works on both the
+Pi 3 and the Pi 4. `bota-driver` only ships 64-bit wheels (aarch64 and x86_64),
+so `pip install` fails on 32-bit Raspberry Pi OS, which many Pi 3 SD cards still
+run. Check with `getconf LONG_BIT` (must print `64`). If you run the sensor
+test on a 32-bit OS anyway, it tells you so.
+
+The camera tools are `rpicam-*` on Bookworm (package `rpicam-apps`) and
+`libcamera-*` on Bullseye (package `libcamera-apps`). The camera test finds
+either one. This is the same tool the payload code calls as `libcamera-vid`.
 
 ```bash
-sudo apt install rpicam-apps          # camera tools, usually already installed
+sudo apt install rpicam-apps          # on Bullseye: sudo apt install libcamera-apps
 cd torquesensor_arducam_test
 python3 -m venv .venv
 source .venv/bin/activate
@@ -129,6 +140,10 @@ startup delay. The final `Sensor: PASS/FAIL  Camera: PASS/FAIL` line is the resu
   wait, so a fast loop could read the same frame twice). If the sensor stops
   sending data, the blocking read waits for it, so a run can last longer than
   `--duration`, and Ctrl+C may not take effect until the next frame arrives.
+- On a Pi 3, the slower CPU has to keep up with every sensor frame while the
+  camera records. Compare the sample rate from `test_torque_sensor.py` alone with
+  the one from `test_both.py`. If the combined rate is clearly lower, or frames
+  show `T` (throttled), the Pi is falling behind.
 - If the camera tool rejects an option (for example `--save-pts` on a version of
   rpicam-apps that dropped it), the error is in `camera_stderr.log` and is
   printed in the summary.
