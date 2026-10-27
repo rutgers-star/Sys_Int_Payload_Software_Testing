@@ -1,0 +1,2 @@
+# Bota torque sensor driver. Wheels exist only for 64-bit (aarch64) Linux, Python 3.9+.
+bota-driver==1.1.6
