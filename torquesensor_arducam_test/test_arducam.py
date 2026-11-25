@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone test for the Arducam / Raspberry Pi camera.
 
-Records a short black-and-white H.264 clip with rpicam-vid (or the older
-libcamera-vid), saves the per-frame timestamps, and checks that the output
+Records a short black-and-white H.264 clip with libcamera-vid (rpicam-vid on
+newer images, the same libcamera app), as the payload does, saves the per-frame timestamps, and checks that the output
 exists, is not empty, and has roughly the expected length.
 """
 
@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,8 +22,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULT_OUT_DIR = HERE / "results"
 
-# rpicam-vid is the name on Raspberry Pi OS Bookworm and later; libcamera-vid on older images.
-CAMERA_COMMANDS = ("rpicam-vid", "libcamera-vid")
+# The payload (camera_control.py) records with libcamera-vid, so that is tried
+# first. Both names are the same libcamera-based app: Raspberry Pi OS Bookworm
+# renamed it rpicam-vid and keeps libcamera-vid as a link to it.
+CAMERA_COMMANDS = ("libcamera-vid", "rpicam-vid")
 
 # Extra time allowed for camera startup and file flush before the process is stopped.
 STARTUP_GRACE_S = 15.0
@@ -53,8 +56,63 @@ def find_camera_command() -> str:
             return path
     raise CameraError(
         f"None of {', '.join(CAMERA_COMMANDS)} found on PATH. "
-        "Install the camera apps with: sudo apt install rpicam-apps"
+        "Install the camera apps with: sudo apt install rpicam-apps "
+        "(libcamera-apps on Bullseye)"
     )
+
+
+def list_cameras(exe: str) -> tuple[bool, str]:
+    """Ask libcamera which cameras it can see, using the matching *-hello tool.
+
+    Returns (detected, text). Raises CameraError if libcamera reports no camera,
+    which would otherwise only show up as an error inside the recording.
+    """
+    hello = shutil.which(Path(exe).name.replace("-vid", "-hello")) or \
+        str(Path(exe).with_name(Path(exe).name.replace("-vid", "-hello")))
+    try:
+        out = subprocess.run([hello, "--list-cameras"], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"could not run {hello} --list-cameras ({e})"
+    text = (out.stdout + out.stderr).strip()
+    if out.returncode != 0 or "available cameras" not in text.lower() or "no cameras" in text.lower():
+        raise CameraError(f"libcamera sees no camera. Output of {hello} --list-cameras:\n{text}\n"
+                          "Check the ribbon cable, the dtoverlay line for your Arducam module "
+                          "and that the legacy camera option is off.")
+    return True, text
+
+
+class FirstDataWatcher:
+    """Notes when the camera's output file first has data.
+
+    --save-pts timestamps start at 0 on the first frame, so this time is how a
+    camera frame is placed on the Pi clock. Polling at 5 ms bounds the error.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.monotonic_s: float | None = None
+        self.utc: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> "FirstDataWatcher":
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.path.stat().st_size > 0:
+                    self.monotonic_s = time.monotonic()
+                    self.utc = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+                    return
+            except OSError:
+                pass
+            self._stop.wait(0.005)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1)
 
 
 def build_command(exe: str, duration_s: float, video_path: Path, pts_path: Path,
@@ -203,6 +261,7 @@ def main() -> int:
 
     try:
         exe = find_camera_command()
+        list_cameras(exe)
     except CameraError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2

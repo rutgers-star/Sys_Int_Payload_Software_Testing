@@ -19,18 +19,29 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "bota_binary_gen0.json"
 DEFAULT_OUT_DIR = HERE / "results"
 
-# Value used in Bota's sample bota_binary_gen0.json. The payload config uses 2,
-# which has not been confirmed on the sensor.
+# Sensor settings the flight code uses: bota_binary_gen0.json in
+# https://github.com/rutgers-star/PayloadSoftware. check_payload_config() reports
+# any difference, so a run with different settings cannot pass unnoticed.
+PAYLOAD_SINC_LENGTH = 64
+PAYLOAD_DRIVER_CONFIG = {
+    "product_name": "BFT-SENS-SER-M8",
+    "serial_number": "SN000853",
+    "communication_interface_name": "Bota_Binary_gen0",
+    "baudrate": 460800,
+    "sinc_length": PAYLOAD_SINC_LENGTH,
+    "wrench_offset": {"fx": 0.0, "fy": 0.0, "fz": 0.0, "tx": 0.0, "ty": 0.0, "tz": 0.0},
+}
+# Value in Bota's own sample config, a fallback to try if the driver rejects the payload value.
 BOTA_SAMPLE_SINC_LENGTH = 128
 
 CSV_HEADER = [
-    "utc_time", "monotonic_s", "elapsed_s", "sensor_timestamp",
+    "utc_time", "monotonic_s", "elapsed_s", "met_s", "sensor_timestamp",
     "status_val", "invalid", "overrange", "throttled",
     "fx", "fy", "fz", "tx", "ty", "tz", "temperature",
 ]
@@ -72,18 +83,39 @@ def config_port(config: dict[str, Any]) -> str:
     return config["driver_config"]["communication_interface_params"]["com_port"]
 
 
+def check_payload_config(config: dict[str, Any]) -> list[str]:
+    """Differences between a driver config and the payload's bota_binary_gen0.json.
+
+    The serial port is not compared: it depends on how the sensor enumerates.
+    """
+    ref = PAYLOAD_DRIVER_CONFIG
+    dc = config.get("driver_config", {})
+    ops = dc.get("sensor_operation_params", {})
+    actual = {
+        "product_name": dc.get("product_name"),
+        "serial_number": dc.get("serial_number"),
+        "communication_interface_name": dc.get("communication_interface_name"),
+        "baudrate": dc.get("communication_interface_params", {}).get("baudrate"),
+        "sinc_length": ops.get("sinc_length"),
+        "wrench_offset": ops.get("wrench_offset"),
+    }
+    return [f"{k}: {actual[k]!r} (payload uses {ref[k]!r})" for k in ref if actual[k] != ref[k]]
+
+
 def sinc_hint(config_path: Path) -> str:
-    """Suggest the sample sinc_length when the configured one may be what failed."""
+    """Point at sinc_length when the driver may have rejected it."""
     try:
         sinc = load_config(config_path)["driver_config"]["sensor_operation_params"]["sinc_length"]
     except (OSError, KeyError, ValueError):
         return ""
-    if sinc == BOTA_SAMPLE_SINC_LENGTH:
-        return ""
+    if sinc != PAYLOAD_SINC_LENGTH:
+        return (f"\n  The config has sinc_length = {sinc}, but the payload uses {PAYLOAD_SINC_LENGTH}. "
+                f"Rerun without --sinc-length, or restore {PAYLOAD_SINC_LENGTH} in bota_binary_gen0.json.")
     return (
-        f"\n  The config has sinc_length = {sinc}. If the driver output above says "
-        f"'Invalid sinc length', change sinc_length to {BOTA_SAMPLE_SINC_LENGTH} "
-        f"in bota_binary_gen0.json,\n  or rerun with --sinc-length {BOTA_SAMPLE_SINC_LENGTH}."
+        f"\n  If the driver output above says 'Invalid sinc length', the payload value "
+        f"({PAYLOAD_SINC_LENGTH}) was rejected by this sensor.\n  Bota's sample config uses "
+        f"{BOTA_SAMPLE_SINC_LENGTH}: try --sinc-length {BOTA_SAMPLE_SINC_LENGTH}, and tell the "
+        f"payload team, since the flight config would fail the same way."
     )
 
 
@@ -104,6 +136,8 @@ def prepare_config(config_path: Path, port: str | None, out_dir: Path,
     """Apply overrides, check the port, and save the config used next to the results."""
     config = load_config(config_path, port, sinc_length)
     check_port(config_port(config))
+    for diff in check_payload_config(config):
+        print(f"WARNING: sensor config differs from the payload repo - {diff}", file=sys.stderr)
     used = out_dir / "bota_config_used.json"
     used.write_text(json.dumps(config, indent=4))
     return used
@@ -162,7 +196,10 @@ def stop_driver(driver: Any, active: bool = True) -> None:
 
 
 def log_sensor(driver: Any, duration_s: float, csv_path: Path,
-               print_hz: float = 10.0, quiet: bool = False) -> SensorStats:
+               print_hz: float = 10.0, quiet: bool = False,
+               stop_when: Callable[[], bool] | None = None,
+               t0: float | None = None,
+               emit: Callable[[str], None] = print) -> SensorStats:
     """Read frames for duration_s, writing every frame to csv_path.
 
     Uses read_frame_blocking() so each loop iteration is one new frame. With
@@ -170,17 +207,26 @@ def log_sensor(driver: Any, duration_s: float, csv_path: Path,
     than once, which inflates the sample count. If the sensor stops
     streaming, a blocking read waits for data, so the loop can overrun
     duration_s. Ctrl+C ends the loop early and the partial stats are returned.
+
+    stop_when: checked every frame; the loop ends early when it returns True.
+    t0: monotonic time that is zero on the shared mission-elapsed-time (MET)
+        clock, written to the met_s column. Defaults to the start of logging.
+    emit: where the status lines go (print by default, a logger for the run log).
     """
     stats = SensorStats()
     print_period = 1.0 / print_hz
     next_print = 0.0
     start = time.monotonic()
+    if t0 is None:
+        t0 = start
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(CSV_HEADER)
         try:
             while time.monotonic() - start < duration_s:
+                if stop_when is not None and stop_when():
+                    break
                 try:
                     frame = driver.read_frame_blocking()
                 except Exception as e:
@@ -200,7 +246,7 @@ def log_sensor(driver: Any, duration_s: float, csv_path: Path,
 
                 writer.writerow([
                     datetime.now(timezone.utc).isoformat(timespec="microseconds"),
-                    f"{now:.6f}", f"{elapsed:.6f}", frame.timestamp,
+                    f"{now:.6f}", f"{elapsed:.6f}", f"{now - t0:.6f}", frame.timestamp,
                     int(s.val), int(s.invalid), int(s.overrange), int(s.throttled),
                     fx, fy, fz, tx, ty, tz, frame.temperature,
                 ])
@@ -209,9 +255,9 @@ def log_sensor(driver: Any, duration_s: float, csv_path: Path,
                     next_print = elapsed + print_period
                     flags = "".join(c for c, on in (("I", s.invalid), ("O", s.overrange),
                                                      ("T", s.throttled)) if on) or "ok"
-                    print(f"{elapsed:7.2f}s  status={flags:<3}  "
-                          f"F=[{fx:8.3f} {fy:8.3f} {fz:8.3f}] N  "
-                          f"T=[{tx:8.4f} {ty:8.4f} {tz:8.4f}] Nm")
+                    emit(f"{elapsed:7.2f}s  status={flags:<3}  "
+                         f"F=[{fx:8.3f} {fy:8.3f} {fz:8.3f}] N  "
+                         f"T=[{tx:8.4f} {ty:8.4f} {tz:8.4f}] Nm")
         except KeyboardInterrupt:
             stats.interrupted = True
         finally:
@@ -241,8 +287,9 @@ def add_sensor_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--port", help="serial port, overrides com_port in the config "
                                        "(config default: /dev/ttyACM0)")
     parser.add_argument("--sinc-length", type=int,
-                        help="overrides sinc_length in the config (config default: 2, "
-                             f"Bota's sample uses {BOTA_SAMPLE_SINC_LENGTH})")
+                        help=f"overrides sinc_length in the config (payload and config default: "
+                             f"{PAYLOAD_SINC_LENGTH}; Bota's sample uses {BOTA_SAMPLE_SINC_LENGTH}). "
+                             "Any other value is flagged as different from the payload.")
 
 
 def main() -> int:
